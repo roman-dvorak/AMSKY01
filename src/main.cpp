@@ -53,26 +53,66 @@ const unsigned long MEASUREMENT_INTERVAL = 2000; // 2 seconds
 
 // TSL2591 auto-gain variables
 tsl2591Gain_t current_gain = TSL2591_GAIN_MED;
+tsl2591IntegrationTime_t current_integration_time = TSL2591_INTEGRATIONTIME_300MS;
 unsigned long last_gain_adjustment = 0;
 const unsigned long GAIN_ADJUSTMENT_INTERVAL = 5000; // 5 seconds between gain adjustments
 const uint16_t GAIN_SATURATED_THRESHOLD = 60000;  // Near saturation (65535 max)
 const uint16_t GAIN_TOO_LOW_THRESHOLD = 1000;     // Too low signal
+const uint16_t INTEGRATION_TIME_INCREASE_THRESHOLD = 500; // Very low signal
 
 // Function to get gain string for debugging
 const char* getGainString(tsl2591Gain_t gain) {
   switch(gain) {
-    case TSL2591_GAIN_LOW:  return "1x";
-    case TSL2591_GAIN_MED:  return "25x";
-    case TSL2591_GAIN_HIGH: return "428x";
-    case TSL2591_GAIN_MAX:  return "9876x";
+    case TSL2591_GAIN_LOW:  return "1";
+    case TSL2591_GAIN_MED:  return "25";
+    case TSL2591_GAIN_HIGH: return "428";
+    case TSL2591_GAIN_MAX:  return "9876";
     default: return "unknown";
   }
 }
 
-// Function to adjust gain based on current light levels
-bool adjustGain(uint16_t full_value) {
+// Function to get gain multiplier value
+float getGainValue(tsl2591Gain_t gain) {
+  switch(gain) {
+    case TSL2591_GAIN_LOW:  return 1.0;
+    case TSL2591_GAIN_MED:  return 25.0;
+    case TSL2591_GAIN_HIGH: return 428.0;
+    case TSL2591_GAIN_MAX:  return 9876.0;
+    default: return 1.0;
+  }
+}
+
+// Function to get integration time in milliseconds
+float getIntegrationTimeMs(tsl2591IntegrationTime_t integrationTime) {
+  switch(integrationTime) {
+    case TSL2591_INTEGRATIONTIME_100MS: return 100.0;
+    case TSL2591_INTEGRATIONTIME_200MS: return 200.0;
+    case TSL2591_INTEGRATIONTIME_300MS: return 300.0;
+    case TSL2591_INTEGRATIONTIME_400MS: return 400.0;
+    case TSL2591_INTEGRATIONTIME_500MS: return 500.0;
+    case TSL2591_INTEGRATIONTIME_600MS: return 600.0;
+    default: return 300.0;
+  }
+}
+
+// Function to get integration time string
+const char* getIntegrationTimeString(tsl2591IntegrationTime_t integrationTime) {
+  switch(integrationTime) {
+    case TSL2591_INTEGRATIONTIME_100MS: return "100";
+    case TSL2591_INTEGRATIONTIME_200MS: return "200";
+    case TSL2591_INTEGRATIONTIME_300MS: return "300";
+    case TSL2591_INTEGRATIONTIME_400MS: return "400";
+    case TSL2591_INTEGRATIONTIME_500MS: return "500";
+    case TSL2591_INTEGRATIONTIME_600MS: return "600";
+    default: return "300";
+  }
+}
+
+// Function to adjust gain and integration time based on current light levels
+bool adjustGainAndIntegrationTime(uint16_t full_value) {
   tsl2591Gain_t new_gain = current_gain;
-  
+  tsl2591IntegrationTime_t new_integration_time = current_integration_time;
+
   // Check if we need to decrease gain (too bright)
   if (full_value > GAIN_SATURATED_THRESHOLD) {
     switch(current_gain) {
@@ -91,17 +131,31 @@ bool adjustGain(uint16_t full_value) {
       case TSL2591_GAIN_MAX:  return false; // Already at maximum
     }
   }
-  else {
-    return false; // No adjustment needed
+
+  // Check if we need to increase integration time (very low light)
+  if (full_value < INTEGRATION_TIME_INCREASE_THRESHOLD) {
+    switch(current_integration_time) {
+      case TSL2591_INTEGRATIONTIME_100MS: new_integration_time = TSL2591_INTEGRATIONTIME_200MS; break;
+      case TSL2591_INTEGRATIONTIME_200MS: new_integration_time = TSL2591_INTEGRATIONTIME_300MS; break;
+      case TSL2591_INTEGRATIONTIME_300MS: new_integration_time = TSL2591_INTEGRATIONTIME_400MS; break;
+      case TSL2591_INTEGRATIONTIME_400MS: new_integration_time = TSL2591_INTEGRATIONTIME_500MS; break;
+      case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_600MS; break;
+      case TSL2591_INTEGRATIONTIME_600MS: return false; // Already at maximum
+    }
   }
-  
-  // Apply new gain
+
+  // Apply new gain and integration time
   current_gain = new_gain;
+  current_integration_time = new_integration_time;
   tsl.setGain(current_gain);
-  
+  tsl.setTiming(current_integration_time);
+
   Serial.print("Gain adjusted to: ");
   Serial.println(getGainString(current_gain));
-  
+
+  Serial.print("Integration time adjusted to: ");
+  Serial.println((int)current_integration_time * 100);
+
   return true;
 }
 
@@ -199,14 +253,14 @@ void loop() {
       sensors_event_t humidity, temp;
       
       if (sht4.getEvent(&humidity, &temp)) {
-        // Output in CSV format: hygro;<temp>;<humid>;
-        Serial.print("hygro;");
+        // Output in CSV format: hygro,\u003ctemp\u003e,\u003chumid\u003e
+        Serial.print("hygro,");
         Serial.print(temp.temperature, 2);
-        Serial.print(";");
+        Serial.print(",");
         Serial.print(humidity.relative_humidity, 2);
-        Serial.println(";");
+        Serial.println();
       } else {
-        Serial.println("hygro;ERROR;ERROR;");
+        Serial.println("hygro,ERROR,ERROR");
       }
     }
     
@@ -220,9 +274,13 @@ void loop() {
       // Calculate actual lux value
       float lux = tsl.calculateLux(full, ir);
       
-      // Check if we need to adjust gain (but not too frequently)
+      // Normalize the lux value by gain and integration time
+      float normalization_factor = getGainValue(current_gain) * getIntegrationTimeMs(current_integration_time) / 300.0; // 300ms is the base integration time
+      float normalized_lux = lux / normalization_factor;
+      
+      // Check if we need to adjust gain and integration time (but not too frequently)
       if (current_time - last_gain_adjustment >= GAIN_ADJUSTMENT_INTERVAL) {
-        if (adjustGain(full)) {
+        if (adjustGainAndIntegrationTime(full)) {
           last_gain_adjustment = current_time;
           // Skip this measurement after gain change to let sensor settle
           last_measurement = current_time;
@@ -230,16 +288,18 @@ void loop() {
         }
       }
 
-      // Output in CSV format: light;<lux>;<full_raw>;<ir_raw>;<gain_string>;
-      Serial.print("light;");
-      Serial.print(lux, 2);  // Lux value with 2 decimal places
-      Serial.print(";");
+      // Output in CSV format: light,normalized_lux,full_raw,ir_raw,gain,integration_time
+      Serial.print("light,");
+      Serial.print(normalized_lux, 2);  // Normalized lux value with 2 decimal places
+      Serial.print(",");
       Serial.print(full);    // Raw full spectrum value
-      Serial.print(";");
+      Serial.print(",");
       Serial.print(ir);      // Raw IR value
-      Serial.print(";");
+      Serial.print(",");
       Serial.print(getGainString(current_gain)); // Current gain setting
-      Serial.println(";");
+      Serial.print(",");
+      Serial.print(getIntegrationTimeString(current_integration_time)); // Current integration time setting
+      Serial.println();
     }
     
     if (mlx90641_available) {
@@ -260,22 +320,22 @@ void loop() {
           
           float avg_val = (float)sum_val / (float)MLX90641_PIXEL_COUNT;
           
-          // Output in CSV format: thermal;min_raw;max_raw;avg_raw;
-          Serial.print("thermal;");
+          // Output in CSV format: thermal,min_raw,max_raw,avg_raw
+          Serial.print("thermal,");
           Serial.print(min_val);
-          Serial.print(";");
+          Serial.print(",");
           Serial.print(max_val);
-          Serial.print(";");
+          Serial.print(",");
           Serial.print(avg_val, 2);
-          Serial.println(";");
+          Serial.println();
           
           // Clear new data bit
           clearNewDataBit();
         } else {
-          Serial.println("thermal;ERROR;ERROR;ERROR;");
+          Serial.println("thermal,ERROR,ERROR,ERROR");
         }
       } else {
-        Serial.println("thermal;NO_NEW_DATA;NO_NEW_DATA;NO_NEW_DATA;");
+        Serial.println("thermal,NO_NEW_DATA,NO_NEW_DATA,NO_NEW_DATA");
       }
     }
 
