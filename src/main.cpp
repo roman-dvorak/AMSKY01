@@ -2,6 +2,11 @@
 #include <Wire.h>
 #include <Adafruit_SHT4x.h>
 #include <Adafruit_TSL2591.h>
+// MLX90641 definitions (from fw_melexis)
+#define MLX90641_I2C_ADDR 0x33
+#define MLX90641_RAM_START 0x0400
+#define MLX90641_PIXEL_COUNT 192
+#define MLX90641_STATUS_REG 0x8000
 #include "version.h"
 
 // Firmware and hardware version info
@@ -20,6 +25,16 @@ Adafruit_SHT4x sht4 = Adafruit_SHT4x();
 
 // Initialize TSL2591 light sensor
 Adafruit_TSL2591 tsl = Adafruit_TSL2591(2591);
+
+// MLX90641 thermal sensor variables
+uint16_t mlx90641_pixelData[MLX90641_PIXEL_COUNT];
+bool mlx90641_available = false;
+
+// MLX90641 helper functions
+bool readRegister(byte deviceAddress, uint16_t registerAddress, uint16_t* data);
+bool readMultipleRegisters(byte deviceAddress, uint16_t startAddress, uint16_t* data, uint16_t length);
+bool checkNewData();
+void clearNewDataBit();
 
 // Variables for LEDs
 bool trigger_led_state = false;
@@ -103,9 +118,9 @@ void setup() {
   digitalWrite(CPU_STATUS_LED, LOW);
   digitalWrite(TRIGGER_OUT_LED, LOW);
   
-  // Print device information
-  Serial.println(DEVICE_NAME);
-  Serial.print("HW Version: ");
+// Print device information
+Serial.println(DEVICE_NAME);
+Serial.print("HW Version: ");
   Serial.println(HW_VERSION);
   Serial.print("FW Version: ");
   Serial.println(FW_VERSION);
@@ -146,6 +161,17 @@ void setup() {
     tsl_available = false;
     Serial.println("TSL2591 light sensor initialization failed");
   }
+  
+  // Initialize MLX90641 thermal sensor
+  Serial.println("Testing MLX90641 thermal sensor...");
+  Wire1.beginTransmission(MLX90641_I2C_ADDR);
+  if (Wire1.endTransmission() == 0) {
+    mlx90641_available = true;
+    Serial.println("MLX90641 thermal sensor initialized successfully");
+  } else {
+    mlx90641_available = false;
+    Serial.println("MLX90641 thermal sensor initialization failed");
+  }
 }
 
 void loop() {
@@ -168,7 +194,7 @@ void loop() {
   }
   
 // Read sensor data every 2 seconds
-  if ((sht4_available || tsl_available) && (current_time - last_measurement >= MEASUREMENT_INTERVAL)) {
+  if ((sht4_available || tsl_available || mlx90641_available) && (current_time - last_measurement >= MEASUREMENT_INTERVAL)) {
     if (sht4_available) {
       sensors_event_t humidity, temp;
       
@@ -215,9 +241,125 @@ void loop() {
       Serial.print(getGainString(current_gain)); // Current gain setting
       Serial.println(";");
     }
+    
+    if (mlx90641_available) {
+      // Check if new data is available
+      if (checkNewData()) {
+        // Read pixel data
+        if (readMultipleRegisters(MLX90641_I2C_ADDR, MLX90641_RAM_START, mlx90641_pixelData, MLX90641_PIXEL_COUNT)) {
+          // Calculate basic statistics from raw data
+          uint16_t min_val = mlx90641_pixelData[0];
+          uint16_t max_val = mlx90641_pixelData[0];
+          uint32_t sum_val = 0;
+          
+          for (int i = 0; i < MLX90641_PIXEL_COUNT; i++) {
+            if (mlx90641_pixelData[i] < min_val) min_val = mlx90641_pixelData[i];
+            if (mlx90641_pixelData[i] > max_val) max_val = mlx90641_pixelData[i];
+            sum_val += mlx90641_pixelData[i];
+          }
+          
+          float avg_val = (float)sum_val / (float)MLX90641_PIXEL_COUNT;
+          
+          // Output in CSV format: thermal;min_raw;max_raw;avg_raw;
+          Serial.print("thermal;");
+          Serial.print(min_val);
+          Serial.print(";");
+          Serial.print(max_val);
+          Serial.print(";");
+          Serial.print(avg_val, 2);
+          Serial.println(";");
+          
+          // Clear new data bit
+          clearNewDataBit();
+        } else {
+          Serial.println("thermal;ERROR;ERROR;ERROR;");
+        }
+      } else {
+        Serial.println("thermal;NO_NEW_DATA;NO_NEW_DATA;NO_NEW_DATA;");
+      }
+    }
 
-    last_measurement = current_time;
+last_measurement = current_time;
+  }
+
+  delay(10); // Small delay to prevent busy waiting
+}
+
+// MLX90641 helper functions implementation (from fw_melexis)
+bool readRegister(byte deviceAddress, uint16_t registerAddress, uint16_t* data) {
+  Wire1.beginTransmission(deviceAddress);
+  Wire1.write(registerAddress >> 8);   // MSB
+  Wire1.write(registerAddress & 0xFF); // LSB
+  
+  if (Wire1.endTransmission(false) != 0) {
+    return false;
   }
   
-  delay(10); // Small delay to prevent busy waiting
+  Wire1.requestFrom(deviceAddress, (uint8_t)2);
+  if (Wire1.available() >= 2) {
+    *data = Wire1.read() << 8;  // MSB
+    *data |= Wire1.read();      // LSB
+    return true;
+  }
+  
+  return false;
+}
+
+bool readMultipleRegisters(byte deviceAddress, uint16_t startAddress, uint16_t* data, uint16_t length) {
+  // Read in smaller chunks to avoid I2C issues
+  const uint16_t CHUNK_SIZE = 16; // Read 16 words at a time
+  uint16_t wordsRead = 0;
+  
+  while (wordsRead < length) {
+    uint16_t wordsToRead = min(CHUNK_SIZE, length - wordsRead);
+    uint16_t currentAddress = startAddress + wordsRead;
+    
+    Wire1.beginTransmission(deviceAddress);
+    Wire1.write(currentAddress >> 8);   // MSB
+    Wire1.write(currentAddress & 0xFF); // LSB
+    
+    if (Wire1.endTransmission(false) != 0) {
+      return false;
+    }
+    
+    Wire1.requestFrom(deviceAddress, (uint8_t)(wordsToRead * 2));
+    
+    for (uint16_t i = 0; i < wordsToRead; i++) {
+      if (Wire1.available() >= 2) {
+        data[wordsRead + i] = Wire1.read() << 8;  // MSB
+        data[wordsRead + i] |= Wire1.read();      // LSB
+      } else {
+        return false;
+      }
+    }
+    
+    wordsRead += wordsToRead;
+    delay(5); // Small delay between chunks
+  }
+  
+  return true;
+}
+
+bool checkNewData() {
+  uint16_t statusReg = 0;
+  if (readRegister(MLX90641_I2C_ADDR, MLX90641_STATUS_REG, &statusReg)) {
+    // Check bit 3 - "New data available in RAM"
+    return (statusReg & 0x0008) != 0;
+  }
+  return false;
+}
+
+void clearNewDataBit() {
+  uint16_t statusReg = 0;
+  if (readRegister(MLX90641_I2C_ADDR, MLX90641_STATUS_REG, &statusReg)) {
+    // Clear bit 3 by writing back the status with bit 3 cleared
+    statusReg &= ~0x0008;
+    
+    Wire1.beginTransmission(MLX90641_I2C_ADDR);
+    Wire1.write(MLX90641_STATUS_REG >> 8);   // MSB
+    Wire1.write(MLX90641_STATUS_REG & 0xFF); // LSB
+    Wire1.write(statusReg >> 8);             // Data MSB
+    Wire1.write(statusReg & 0xFF);           // Data LSB
+    Wire1.endTransmission();
+  }
 }
