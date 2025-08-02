@@ -59,10 +59,16 @@ tsl2591IntegrationTime_t current_integration_time = TSL2591_INTEGRATIONTIME_300M
 unsigned long last_gain_adjustment = 0;
 const unsigned long GAIN_ADJUSTMENT_INTERVAL = 5000; // 5 seconds between gain adjustments
 const uint16_t GAIN_SATURATED_THRESHOLD = 60000;  // Near saturation (65535 max)
-const uint16_t GAIN_TOO_LOW_THRESHOLD = 1000;     // Too low signal
-const uint16_t INTEGRATION_TIME_INCREASE_THRESHOLD = 500; // Very low signal
+const uint16_t GAIN_TOO_LOW_THRESHOLD = 2000;     // Too low signal
+const uint16_t INTEGRATION_TIME_INCREASE_THRESHOLD = 1500; // Very low signal
+const uint16_t INTEGRATION_TIME_DECREASE_THRESHOLD = 50000; // High signal
 
-
+typedef struct {
+  int16_t offset;
+  float alpha;
+  float kta;
+  float kv;
+} PixelParams;
 
 // Function to get gain string for debugging
 const char* getGainString(tsl2591Gain_t gain) {
@@ -112,52 +118,102 @@ const char* getIntegrationTimeString(tsl2591IntegrationTime_t integrationTime) {
   }
 }
 
-// Function to adjust gain and integration time based on current light levels
+// Smarter auto-adjustment for gain and integration time
 bool adjustGainAndIntegrationTime(uint16_t full_value) {
   tsl2591Gain_t new_gain = current_gain;
   tsl2591IntegrationTime_t new_integration_time = current_integration_time;
+  bool changed = false;
 
-  // Check if we need to decrease gain (too bright)
+  // If signal is saturated, try to decrease gain first, then integration time
   if (full_value > GAIN_SATURATED_THRESHOLD) {
-    switch(current_gain) {
-      case TSL2591_GAIN_MAX:  new_gain = TSL2591_GAIN_HIGH; break;
-      case TSL2591_GAIN_HIGH: new_gain = TSL2591_GAIN_MED; break;
-      case TSL2591_GAIN_MED:  new_gain = TSL2591_GAIN_LOW; break;
-      case TSL2591_GAIN_LOW:  return false; // Already at minimum
+    if (current_gain != TSL2591_GAIN_LOW) {
+      // Prefer lowering gain first
+      switch(current_gain) {
+        case TSL2591_GAIN_MAX:  new_gain = TSL2591_GAIN_HIGH; break;
+        case TSL2591_GAIN_HIGH: new_gain = TSL2591_GAIN_MED; break;
+        case TSL2591_GAIN_MED:  new_gain = TSL2591_GAIN_LOW; break;
+        default: break;
+      }
+      changed = true;
+    } else if (current_integration_time != TSL2591_INTEGRATIONTIME_100MS) {
+      // If already at lowest gain, decrease integration time
+      switch(current_integration_time) {
+        case TSL2591_INTEGRATIONTIME_600MS: new_integration_time = TSL2591_INTEGRATIONTIME_500MS; break;
+        case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_400MS; break;
+        case TSL2591_INTEGRATIONTIME_400MS: new_integration_time = TSL2591_INTEGRATIONTIME_300MS; break;
+        case TSL2591_INTEGRATIONTIME_300MS: new_integration_time = TSL2591_INTEGRATIONTIME_200MS; break;
+        case TSL2591_INTEGRATIONTIME_200MS: new_integration_time = TSL2591_INTEGRATIONTIME_100MS; break;
+        default: break;
+      }
+      changed = true;
     }
   }
-  // Check if we need to increase gain (too dark)
+  // If signal is very low, try to increase integration time first, then gain
+  else if (full_value < INTEGRATION_TIME_INCREASE_THRESHOLD) {
+    if (current_integration_time != TSL2591_INTEGRATIONTIME_600MS) {
+      switch(current_integration_time) {
+        case TSL2591_INTEGRATIONTIME_100MS: new_integration_time = TSL2591_INTEGRATIONTIME_200MS; break;
+        case TSL2591_INTEGRATIONTIME_200MS: new_integration_time = TSL2591_INTEGRATIONTIME_300MS; break;
+        case TSL2591_INTEGRATIONTIME_300MS: new_integration_time = TSL2591_INTEGRATIONTIME_400MS; break;
+        case TSL2591_INTEGRATIONTIME_400MS: new_integration_time = TSL2591_INTEGRATIONTIME_500MS; break;
+        case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_600MS; break;
+        default: break;
+      }
+      changed = true;
+    } else if (current_gain != TSL2591_GAIN_MAX) {
+      switch(current_gain) {
+        case TSL2591_GAIN_LOW:  new_gain = TSL2591_GAIN_MED; break;
+        case TSL2591_GAIN_MED:  new_gain = TSL2591_GAIN_HIGH; break;
+        case TSL2591_GAIN_HIGH: new_gain = TSL2591_GAIN_MAX; break;
+        default: break;
+      }
+      changed = true;
+    }
+  }
+  // If signal is a bit high, but not saturated, decrease integration time if possible
+  else if (full_value > INTEGRATION_TIME_DECREASE_THRESHOLD) {
+    if (current_integration_time != TSL2591_INTEGRATIONTIME_100MS) {
+      switch(current_integration_time) {
+        case TSL2591_INTEGRATIONTIME_600MS: new_integration_time = TSL2591_INTEGRATIONTIME_500MS; break;
+        case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_400MS; break;
+        case TSL2591_INTEGRATIONTIME_400MS: new_integration_time = TSL2591_INTEGRATIONTIME_300MS; break;
+        case TSL2591_INTEGRATIONTIME_300MS: new_integration_time = TSL2591_INTEGRATIONTIME_200MS; break;
+        case TSL2591_INTEGRATIONTIME_200MS: new_integration_time = TSL2591_INTEGRATIONTIME_100MS; break;
+        default: break;
+      }
+      changed = true;
+    }
+  }
+  // If signal is a bit low, but not very low, increase integration time if possible
   else if (full_value < GAIN_TOO_LOW_THRESHOLD) {
-    switch(current_gain) {
-      case TSL2591_GAIN_LOW:  new_gain = TSL2591_GAIN_MED; break;
-      case TSL2591_GAIN_MED:  new_gain = TSL2591_GAIN_HIGH; break;
-      case TSL2591_GAIN_HIGH: new_gain = TSL2591_GAIN_MAX; break;
-      case TSL2591_GAIN_MAX:  return false; // Already at maximum
+    if (current_integration_time != TSL2591_INTEGRATIONTIME_600MS) {
+      switch(current_integration_time) {
+        case TSL2591_INTEGRATIONTIME_100MS: new_integration_time = TSL2591_INTEGRATIONTIME_200MS; break;
+        case TSL2591_INTEGRATIONTIME_200MS: new_integration_time = TSL2591_INTEGRATIONTIME_300MS; break;
+        case TSL2591_INTEGRATIONTIME_300MS: new_integration_time = TSL2591_INTEGRATIONTIME_400MS; break;
+        case TSL2591_INTEGRATIONTIME_400MS: new_integration_time = TSL2591_INTEGRATIONTIME_500MS; break;
+        case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_600MS; break;
+        default: break;
+      }
+      changed = true;
     }
   }
 
-  // Check if we need to increase integration time (very low light)
-  if (full_value < INTEGRATION_TIME_INCREASE_THRESHOLD) {
-    switch(current_integration_time) {
-      case TSL2591_INTEGRATIONTIME_100MS: new_integration_time = TSL2591_INTEGRATIONTIME_200MS; break;
-      case TSL2591_INTEGRATIONTIME_200MS: new_integration_time = TSL2591_INTEGRATIONTIME_300MS; break;
-      case TSL2591_INTEGRATIONTIME_300MS: new_integration_time = TSL2591_INTEGRATIONTIME_400MS; break;
-      case TSL2591_INTEGRATIONTIME_400MS: new_integration_time = TSL2591_INTEGRATIONTIME_500MS; break;
-      case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_600MS; break;
-      case TSL2591_INTEGRATIONTIME_600MS: return false; // Already at maximum
-    }
+  if (!changed || (new_gain == current_gain && new_integration_time == current_integration_time)) {
+    return false;
   }
 
   // Apply new gain and integration time
   current_gain = new_gain;
   current_integration_time = new_integration_time;
+  
   tsl.setGain(current_gain);
   tsl.setTiming(current_integration_time);
 
-  Serial.print("Gain adjusted to: ");
+  Serial.print("# Gain adjusted to: ");
   Serial.println(getGainString(current_gain));
 
-  Serial.print("Integration time adjusted to: ");
+  Serial.print("# Integration time adjusted to: ");
   Serial.println((int)current_integration_time * 100);
 
   return true;
@@ -248,9 +304,9 @@ void loop() {
   float phase = (current_time % CPU_BREATHING_PERIOD) / (float)CPU_BREATHING_PERIOD;
   float sine_wave = sin(phase * 2 * MY_PI);
   
-  // Convert sine wave (-1 to 1) to PWM duty cycle (0 to 255)
-  // Use absolute value to make it always positive, then scale
-  int pwm_value = (int)(127.5 + 127.5 * sine_wave);
+  // Convert sine wave (-1 to 1) to PWM duty cycle (0 to 64) - reduced brightness
+  // Use absolute value to make it always positive, then scale to 25% of original brightness
+  int pwm_value = (int)(32 + 32 * sine_wave);
   
   analogWrite(CPU_STATUS_LED, pwm_value);
   
@@ -268,13 +324,13 @@ void loop() {
       
       if (sht4.getEvent(&humidity, &temp)) {
         // Output in CSV format: hygro,\u003ctemp\u003e,\u003chumid\u003e
-        Serial.print("hygro,");
+        Serial.print("$hygro,");
         Serial.print(temp.temperature, 2);
         Serial.print(",");
         Serial.print(humidity.relative_humidity, 2);
         Serial.println();
       } else {
-        Serial.println("hygro,ERROR,ERROR");
+        Serial.println("$hygro,-999,-999");
       }
     }
     
@@ -303,7 +359,7 @@ void loop() {
       }
 
       // Output in CSV format: light,normalized_lux,full_raw,ir_raw,gain,integration_time
-      Serial.print("light,");
+      Serial.print("$light,");
       Serial.print(normalized_lux, 2);  // Normalized lux value with 2 decimal places
       Serial.print(",");
       Serial.print(full);    // Raw full spectrum value
@@ -316,122 +372,249 @@ void loop() {
       Serial.println();
     }
     if (mlx90641_available) {
-  if (checkNewData()) {
-    Serial.println("# New MLX90641 data available");
 
-    if (readMultipleRegisters(MLX90641_I2C_ADDR, MLX90641_RAM_START, mlx90641_pixelData, MLX90641_PIXEL_COUNT)) {
-      Serial.println("# Successfully read RAM pixel data");
 
-      Serial.println("# MLX90641 Pixel Data:");
-      Serial.print("ThermopileRaw");
-      for (int i = 0; i < MLX90641_PIXEL_COUNT; i++) {
-        Serial.print(",");
-        Serial.print(mlx90641_pixelData[i]);
-      }
-      Serial.println();
 
-      // === [1] Základní statistika pixelů ===
-      uint16_t min_val = mlx90641_pixelData[0];
-      uint16_t max_val = mlx90641_pixelData[0];
-      uint32_t sum_val = 0;
-      for (int i = 0; i < MLX90641_PIXEL_COUNT; i++) {
-        if (mlx90641_pixelData[i] < min_val) min_val = mlx90641_pixelData[i];
-        if (mlx90641_pixelData[i] > max_val) max_val = mlx90641_pixelData[i];
-        sum_val += mlx90641_pixelData[i];
-      }
-      float avg_val = (float)sum_val / MLX90641_PIXEL_COUNT;
 
-      Serial.print("# Pixel stats – Min: "); Serial.print(min_val);
-      Serial.print(" Max: "); Serial.print(max_val);
-      Serial.print(" Avg: "); Serial.println(avg_val, 2);
 
-      // === [2] Čtení RAM hodnot ===
-      Serial.println("# Reading RAM registers (PTAT, VBE, VddPix)...");
-      uint16_t ptat_raw, vbe_raw, vddpix_raw;
-      readRegister(MLX90641_I2C_ADDR, 0x05A0, &ptat_raw);
-      readRegister(MLX90641_I2C_ADDR, 0x0580, &vbe_raw);
-      readRegister(MLX90641_I2C_ADDR, 0x05AA, &vddpix_raw);
 
-      Serial.print("# PTAT raw: "); Serial.println(ptat_raw);
-      Serial.print("# VBE raw: "); Serial.println(vbe_raw);
-      Serial.print("# VddPix raw: "); Serial.println(vddpix_raw);
 
-      // === [3] Čtení EEPROM kalibračních konstant ===
-      Serial.println("# Reading EEPROM calibration constants...");
-      uint16_t vdd25_raw, kvdd_raw, ktptat_raw, kvptat_raw, alphaptat_raw;
-      uint16_t ptat25_raw_1, ptat25_raw_2;
 
-      readRegister(MLX90641_I2C_ADDR, 0x2426, &vdd25_raw);
-      readRegister(MLX90641_I2C_ADDR, 0x2427, &kvdd_raw);
-      readRegister(MLX90641_I2C_ADDR, 0x242A, &ktptat_raw);
-      readRegister(MLX90641_I2C_ADDR, 0x242B, &kvptat_raw);
-      readRegister(MLX90641_I2C_ADDR, 0x242C, &alphaptat_raw);
-      readRegister(MLX90641_I2C_ADDR, 0x2428, &ptat25_raw_1);
-      readRegister(MLX90641_I2C_ADDR, 0x2429, &ptat25_raw_2);
 
-      // === [4] Zpracování hodnot ===
-      int16_t ptat = (ptat_raw > 32767) ? ptat_raw - 65536 : ptat_raw;
-      int16_t vbe  = (vbe_raw > 32767)  ? vbe_raw - 65536  : vbe_raw;
-      int16_t vddpix = (vddpix_raw > 32767) ? vddpix_raw - 65536 : vddpix_raw;
 
-      int16_t vdd25 = (vdd25_raw & 0x07FF);
-      if (vdd25 > 1023) vdd25 -= 2048;
-      vdd25 *= 25;
 
-      int16_t kvdd = (kvdd_raw & 0x07FF);
-      if (kvdd > 1023) kvdd -= 2048;
-      kvdd *= 25;
 
-      float resolution_corr = 1.0f; // Zjednodušeno
 
-      float vdd = (resolution_corr * vddpix - vdd25) / (float)kvdd + 3.3f;
 
-      float kvptat = (kvptat_raw & 0x07FF);
-      if (kvptat > 1023) kvptat -= 2048;
-      kvptat = kvptat / 4096.0f;
 
-      float ktptat = (ktptat_raw & 0x07FF);
-      if (ktptat > 1023) ktptat -= 2048;
-      ktptat = ktptat / 8.0f;
 
-      float alpha_ptat = (alphaptat_raw & 0x07FF) / 134217728.0f;
 
-      uint16_t ptat25 = 32 * (ptat25_raw_1 & 0x07FF) + (ptat25_raw_2 & 0x07FF);
 
-      Serial.print("# Decoded Vdd25: "); Serial.println(vdd25);
-      Serial.print("# Decoded KvVdd: "); Serial.println(kvdd);
-      Serial.print("# Decoded KvPTAT: "); Serial.println(kvptat, 6);
-      Serial.print("# Decoded KtPTAT: "); Serial.println(ktptat, 6);
-      Serial.print("# Decoded AlphaPTAT: "); Serial.println(alpha_ptat, 8);
-      Serial.print("# Decoded PTAT25: "); Serial.println(ptat25);
 
-      float deltaV = (vddpix - vdd25) / (float)kvdd;
-      float Vptat_art = (ptat / (ptat * alpha_ptat + vbe)) * 262144.0f;
 
-      float Ta = ((Vptat_art / (1.0f + kvptat * deltaV)) - ptat25) / ktptat + 25.0f;
 
-      // === [5] Výstup ===
-      Serial.println("# Computation done!");
-      Serial.print("# Vdd = "); Serial.print(vdd, 4); Serial.println(" V");
-      Serial.print("# Ta  = "); Serial.print(Ta, 2); Serial.println(" °C");
 
-      Serial.print("thermal,");
-      Serial.print(min_val); Serial.print(",");
-      Serial.print(max_val); Serial.print(",");
-      Serial.print(avg_val, 2); Serial.print(",");
-      Serial.print("vdd="); Serial.print(vdd, 3); Serial.print("V,");
-      Serial.print("ta="); Serial.print(Ta, 2); Serial.println("C");
 
-      clearNewDataBit();
-    } else {
-      Serial.println("# Failed to read pixel data");
-      Serial.println("thermal,ERROR,ERROR,ERROR");
-    }
-  } else {
-    Serial.println("# No new data available");
-    Serial.println("thermal,NO_NEW_DATA,NO_NEW_DATA,NO_NEW_DATA");
+
+if (checkNewData()) {
+
+  PixelParams pixels[192];
+  uint16_t eepromData[832];
+  readMultipleRegisters(MLX90641_I2C_ADDR, 0x2400, eepromData, 832);
+
+  // Per-pixel offset
+  for (int i = 0; i < 192; i++) {
+    pixels[i].offset = (int16_t)eepromData[512 + i];
   }
+
+  // Alpha ref a scale
+  uint8_t alphaScale = (eepromData[32] >> 12) & 0xF;
+  float alphaRef = (float)eepromData[33] / powf(2.0, alphaScale);
+
+  for (int i = 0; i < 192; i++) {
+    int16_t alphaVal = eepromData[384 + i];
+    pixels[i].alpha = (alphaVal / powf(2.0, alphaScale));
+  }
+
+  // Kta a Kv (dle dokumentace jsou 6bitové signed hodnoty)
+  int8_t ktaScale1 = (eepromData[56] >> 8) & 0xF;
+  int8_t kvScale = (eepromData[56] >> 4) & 0xF;
+
+  for (int i = 0; i < 192; i++) {
+    int8_t rawKta = (int8_t)((eepromData[640 + i] >> 8) & 0xFF);
+    int8_t rawKv  = (int8_t)(eepromData[640 + i] & 0xFF);
+    pixels[i].kta = rawKta / powf(2.0f, ktaScale1);
+    pixels[i].kv  = rawKv  / powf(2.0f, kvScale);
+  }
+
+  // Čtení RAM + pomocných registrů
+  if (readMultipleRegisters(MLX90641_I2C_ADDR, MLX90641_RAM_START, mlx90641_pixelData, MLX90641_PIXEL_COUNT)) {
+    uint16_t ptat_raw, vbe_raw, vddpix_raw;
+    readRegister(MLX90641_I2C_ADDR, 0x05A0, &ptat_raw);
+    readRegister(MLX90641_I2C_ADDR, 0x0580, &vbe_raw);
+    readRegister(MLX90641_I2C_ADDR, 0x05AA, &vddpix_raw);
+
+    uint16_t vdd25_raw, kvdd_raw, ktptat_raw, kvptat_raw, alphaptat_raw;
+    uint16_t ptat25_raw_1, ptat25_raw_2;
+    readRegister(MLX90641_I2C_ADDR, 0x2426, &vdd25_raw);
+    readRegister(MLX90641_I2C_ADDR, 0x2427, &kvdd_raw);
+    readRegister(MLX90641_I2C_ADDR, 0x242A, &ktptat_raw);
+    readRegister(MLX90641_I2C_ADDR, 0x242B, &kvptat_raw);
+    readRegister(MLX90641_I2C_ADDR, 0x242C, &alphaptat_raw);
+    readRegister(MLX90641_I2C_ADDR, 0x2428, &ptat25_raw_1);
+    readRegister(MLX90641_I2C_ADDR, 0x2429, &ptat25_raw_2);
+
+    // Výpočet Vdd
+    int16_t vddpix = (int16_t)vddpix_raw;
+    int16_t vdd25 = (vdd25_raw & 0x07FF); if (vdd25 > 1023) vdd25 -= 2048; vdd25 *= 25;
+    int16_t kvdd = (kvdd_raw & 0x07FF); if (kvdd > 1023) kvdd -= 2048; kvdd *= 25;
+    float vdd = ((float)vddpix - vdd25) / (float)kvdd + 3.3f;
+
+    // Výpočet Ta
+    int16_t ptat = (int16_t)ptat_raw;
+    int16_t vbe = (int16_t)vbe_raw;
+
+    float kvptat = (kvptat_raw & 0x07FF); if (kvptat > 1023) kvptat -= 2048; kvptat = kvptat / 4096.0f;
+    float ktptat = (ktptat_raw & 0x07FF); if (ktptat > 1023) ktptat -= 2048; ktptat = ktptat / 8.0f;
+    float alpha_ptat = (alphaptat_raw & 0x07FF) / 134217728.0f;
+    uint16_t ptat25 = 32 * (ptat25_raw_1 & 0x07FF) + (ptat25_raw_2 & 0x07FF);
+
+    float deltaV = ((float)vddpix - vdd25) / (float)kvdd;
+    float v_ptat = ptat / (ptat * alpha_ptat + vbe);
+    float v_ptat_art = v_ptat * 262144.0f;
+    float Ta = ((v_ptat_art / (1.0f + kvptat * deltaV)) - ptat25) / ktptat + 25.0f;
+    Ta /= 10.0f;
+
+    // Serial.println("# MLX90641 raw pixel data");
+    // for (int i = 0; i < 192; i++) {
+    //   Serial.print(mlx90641_pixelData[i]);
+    //   if (i < 767) Serial.print(",");
+    // }
+
+    // Serial.println("# MLX90641 offset matrix");
+    // for (int i = 0; i < 192; i++) {
+    //   Serial.print(pixels[i].offset);
+    //   if (i < 767) Serial.print(",");
+    // }
+
+    // Serial.println();
+
+    // Serial.println("# MLX90641 alpha matrix");
+    // for (int i = 0; i < 192; i++) {
+    //   Serial.print(pixels[i].alpha, 6);
+    //   if (i < 767) Serial.print(",");
+    // }
+    
+    // Serial.println();
+
+    // Serial.println("# MLX90641 kta matrix");
+    // for (int i = 0; i < 192; i++) {
+    //   Serial.print(pixels[i].kta, 6);
+    //   if (i < 767) Serial.print(",");
+    // }
+    
+    // Serial.println();
+
+    // Serial.println("# MLX90641 kv matrix");
+    // for (int i = 0; i < 192; i++) {
+    //   Serial.print(pixels[i].kv, 6);
+    //   if (i < 767) Serial.print(",");
+    // } 
+
+    // Serial.println();
+
+    // === Výpočet teplot pixelů ===
+    //Serial.println("CorrectedPixels");
+    for (int i = 0; i < 192; i++) {
+      int16_t raw = mlx90641_pixelData[i];
+      float irData = (float)raw - pixels[i].offset;
+      irData -= pixels[i].kta * (Ta - 25.0f);
+      irData -= pixels[i].kv * (vdd - 3.3f);
+      
+      float ir_corrected = irData / pixels[i].alpha;
+      float temperature = Ta + ir_corrected * 0.01f;
+      
+      if (!isfinite(temperature)) {
+        //Serial.print("ovf");
+      } else {
+        //Serial.print(temperature, 2);
+      }
+
+      //if (i < 767) Serial.print(",");
+    }
+    Serial.println();
+
+    Serial.println(String("$thr_parameters,") + vdd + "," + Ta);
+
+
+    float TL = 0, TR = 0, BL = 0, BR = 0, CTR = 0;
+    int count = 0;
+
+    // Levý horní roh (TL): řádky 0-4, sloupce 0-4
+    count = 0;
+    for (int r = 0; r < 5; r++) {
+      for (int c = 0; c < 5; c++) {
+      TL += mlx90641_pixelData[r * 12 + c];
+      count++;
+      }
+    }
+    TL /= count;
+
+    // Pravý horní roh (TR): řádky 0-4, sloupce 7-11
+    count = 0;
+    for (int r = 0; r < 5; r++) {
+      for (int c = 7; c < 12; c++) {
+      TR += mlx90641_pixelData[r * 12 + c];
+      count++;
+      }
+    }
+    TR /= count;
+
+    // Levý dolní roh (BL): řádky 11-15, sloupce 0-4
+    count = 0;
+    for (int r = 11; r < 16; r++) {
+      for (int c = 0; c < 5; c++) {
+      BL += mlx90641_pixelData[r * 12 + c];
+      count++;
+      }
+    }
+    BL /= count;
+
+    // Pravý dolní roh (BR): řádky 11-15, sloupce 7-11
+    count = 0;
+    for (int r = 11; r < 16; r++) {
+      for (int c = 7; c < 12; c++) {
+      BR += mlx90641_pixelData[r * 12 + c];
+      count++;
+      }
+    }
+    BR /= count;
+
+    // Střed (CTR): řádky 5-9, sloupce 3-7
+    count = 0;
+    for (int r = 5; r < 10; r++) {
+      for (int c = 3; c < 8; c++) {
+      CTR += mlx90641_pixelData[r * 12 + c];
+      count++;
+      }
+    }
+    CTR /= count;
+
+    Serial.print("$cloud,");
+    Serial.print(TL, 2); Serial.print(",");
+    Serial.print(TR, 2); Serial.print(",");
+    Serial.print(BL, 2); Serial.print(",");
+    Serial.print(BR, 2); Serial.print(",");
+    Serial.print(CTR, 2);
+    Serial.println();
+
+
+    
+
+    clearNewDataBit();
+  } else {
+    Serial.println("# Failed to read pixel data");
+  }
+} else {
+  Serial.println("# No new data available");
 }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 last_measurement = current_time;
@@ -439,6 +622,7 @@ last_measurement = current_time;
 
   delay(10); // Small delay to prevent busy waiting
 }
+
 
 
 bool writeRegister(uint8_t i2c_addr, uint16_t reg, uint16_t value) {
@@ -452,26 +636,38 @@ bool writeRegister(uint8_t i2c_addr, uint16_t reg, uint16_t value) {
 
 bool readRegister(uint8_t i2c_addr, uint16_t reg, uint16_t* value) {
   // Zapiš adresu registru
-  Wire.beginTransmission(i2c_addr);
-  Wire.write(reg >> 8);
-  Wire.write(reg & 0xFF);
-  if (Wire.endTransmission(false) != 0) {  // POZOR: STOP místo repeated start
+  Wire1.beginTransmission(i2c_addr);
+  Wire1.write(reg >> 8);
+  Wire1.write(reg & 0xFF);
+
+  if (Wire1.endTransmission(false) != 0) {
     Serial.println("# I2C write address phase failed!");
     return false;
   }
 
   // Čti 2 bajty ze zařízení
-  Wire.requestFrom(i2c_addr, (uint8_t)2);
-  if (Wire.available() < 2) {
+  Wire1.requestFrom(i2c_addr, (uint8_t)2);
+  if (Wire1.available() < 2) {
     Serial.println("# I2C read failed – not enough bytes!");
     return false;
   }
 
-  *value = (Wire.read() << 8) | Wire.read();
-  Serial.print("# Read 0x"); Serial.print(reg, HEX);
-  Serial.print(" = 0x"); Serial.println(*value, HEX);
+  uint16_t raw = (Wire1.read() << 8) | Wire1.read();
+
+  // Pokud adresa spadá do EEPROM rozsahu, odstraň Hamming
+  if (reg >= 0x2400 && reg <= 0x273F) {
+    *value = raw & 0x07FF; // pouze bity D0–D10
+  } else {
+    *value = raw; // ostatní čteme celé
+  }
+
+  //Serial.print("# Read 0x"); Serial.print(reg, HEX);
+  //Serial.print(" = 0x"); Serial.print(raw, HEX);
+  //Serial.print(" → data = 0x"); Serial.println(*value, HEX);
+
   return true;
 }
+
 
 
 
@@ -487,7 +683,6 @@ bool readMultipleRegisters(byte deviceAddress, uint16_t startAddress, uint16_t* 
     Wire1.write(currentAddress >> 8);
     Wire1.write(currentAddress & 0xFF);
     
-    // POZOR: STOP místo repeated start
     if (Wire1.endTransmission(false) != 0) {
       Serial.print("# I2C write failed at reg 0x");
       Serial.println(currentAddress, HEX);
@@ -499,6 +694,11 @@ bool readMultipleRegisters(byte deviceAddress, uint16_t startAddress, uint16_t* 
     for (uint16_t i = 0; i < wordsToRead; i++) {
       if (Wire1.available() >= 2) {
         data[wordsRead + i] = (Wire1.read() << 8) | Wire1.read();
+
+        if ((startAddress + wordsRead + i) >= 0x0400 && (startAddress + wordsRead + i) < 0x0800) {
+          data[wordsRead + i] &= 0x07FF; // clear Hamming bits for RAM addresses only
+        }
+
       } else {
         Serial.println("# I2C read underflow!");
         return false;
@@ -516,14 +716,11 @@ bool readMultipleRegisters(byte deviceAddress, uint16_t startAddress, uint16_t* 
 bool checkNewData() {
   uint16_t statusReg = 0;
   if (readRegister(MLX90641_I2C_ADDR, MLX90641_STATUS_REG, &statusReg)) {
-    Serial.print("MLX90641 Status Register: 0x");
-    Serial.println(statusReg, HEX);
     // Check bit 3 - "New data available in RAM"
     return (statusReg & 0x0008) != 0;
   }
 
   Serial.println("#Failed to read MLX90641 status register");
-  return true;
   return false;
 }
 
