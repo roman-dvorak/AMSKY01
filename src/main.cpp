@@ -59,9 +59,21 @@ tsl2591IntegrationTime_t current_integration_time = TSL2591_INTEGRATIONTIME_300M
 unsigned long last_gain_adjustment = 0;
 const unsigned long GAIN_ADJUSTMENT_INTERVAL = 5000; // 5 seconds between gain adjustments
 const uint16_t GAIN_SATURATED_THRESHOLD = 60000;  // Near saturation (65535 max)
+const uint16_t EXTREME_SATURATED_THRESHOLD = 64000; // Extreme saturation - reduce both parameters
 const uint16_t GAIN_TOO_LOW_THRESHOLD = 2000;     // Too low signal
 const uint16_t INTEGRATION_TIME_INCREASE_THRESHOLD = 1500; // Very low signal
 const uint16_t INTEGRATION_TIME_DECREASE_THRESHOLD = 50000; // High signal
+
+// Smart alternating adjustment tracking
+enum LastAdjustmentType {
+  ADJUST_NONE = 0,
+  ADJUST_GAIN = 1,
+  ADJUST_INTEGRATION = 2,
+  ADJUST_BOTH = 3
+};
+LastAdjustmentType last_adjustment_type = ADJUST_NONE;
+uint16_t previous_measurement = 0;
+bool improvement_detected = false;
 
 typedef struct {
   int16_t offset;
@@ -123,11 +135,58 @@ bool adjustGainAndIntegrationTime(uint16_t full_value) {
   tsl2591Gain_t new_gain = current_gain;
   tsl2591IntegrationTime_t new_integration_time = current_integration_time;
   bool changed = false;
+  // Intelligent adaptive adjustment
+  improvement_detected = (full_value != previous_measurement);
 
-  // If signal is saturated, try to decrease gain first, then integration time
-  if (full_value > GAIN_SATURATED_THRESHOLD) {
+  if (!improvement_detected) {
+    // Alternate adjustment to determine efficiency
+    last_adjustment_type = (last_adjustment_type == ADJUST_GAIN) ? ADJUST_INTEGRATION : ADJUST_GAIN;
+  } else {
+    last_adjustment_type = ADJUST_BOTH;
+  }
+
+  previous_measurement = full_value;
+  
+  if (last_adjustment_type == ADJUST_GAIN || last_adjustment_type == ADJUST_BOTH) {
+    // Handle extreme saturation with priority on gain reduction
+if (full_value > EXTREME_SATURATED_THRESHOLD) {
+      // Emergency: extreme saturation - reduce gain aggressively first
+      if (current_gain != TSL2591_GAIN_LOW) {
+        // Drop gain more aggressively for extreme saturation
+        switch(current_gain) {
+          case TSL2591_GAIN_MAX:  new_gain = TSL2591_GAIN_MED; break;  // Skip HIGH gain
+          case TSL2591_GAIN_HIGH: new_gain = TSL2591_GAIN_LOW; break;  // Skip MED gain
+          case TSL2591_GAIN_MED:  new_gain = TSL2591_GAIN_LOW; break;
+          default: break;
+        }
+        changed = true;
+      }
+    }
+  }
+
+  if (last_adjustment_type == ADJUST_INTEGRATION || last_adjustment_type == ADJUST_BOTH) {
+    // Also reduce integration time aggressively
+if (full_value > EXTREME_SATURATED_THRESHOLD) {
+      if (current_integration_time != TSL2591_INTEGRATIONTIME_100MS) {
+        switch(current_integration_time) {
+          case TSL2591_INTEGRATIONTIME_600MS: new_integration_time = TSL2591_INTEGRATIONTIME_300MS; break; // Skip 500MS and 400MS
+          case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_200MS; break; // Skip 400MS and 300MS
+          case TSL2591_INTEGRATIONTIME_400MS: new_integration_time = TSL2591_INTEGRATIONTIME_100MS; break; // Skip 300MS and 200MS
+          case TSL2591_INTEGRATIONTIME_300MS: new_integration_time = TSL2591_INTEGRATIONTIME_100MS; break; // Skip 200MS
+          case TSL2591_INTEGRATIONTIME_200MS: new_integration_time = TSL2591_INTEGRATIONTIME_100MS; break;
+          default: break;
+        }
+        changed = true;
+      }
+    }
+  }
+  
+  // Handle regular saturation with smart alternating 
+  if (full_value > GAIN_SATURATED_THRESHOLD && full_value <= EXTREME_SATURATED_THRESHOLD) {
+    if (last_adjustment_type == ADJUST_GAIN || last_adjustment_type == ADJUST_BOTH) {
+    // Priority: reduce gain and integration time together to prevent saturation
+    // First, try to reduce gain if not at minimum
     if (current_gain != TSL2591_GAIN_LOW) {
-      // Prefer lowering gain first
       switch(current_gain) {
         case TSL2591_GAIN_MAX:  new_gain = TSL2591_GAIN_HIGH; break;
         case TSL2591_GAIN_HIGH: new_gain = TSL2591_GAIN_MED; break;
@@ -135,8 +194,9 @@ bool adjustGainAndIntegrationTime(uint16_t full_value) {
         default: break;
       }
       changed = true;
-    } else if (current_integration_time != TSL2591_INTEGRATIONTIME_100MS) {
-      // If already at lowest gain, decrease integration time
+    }
+    // Also try to reduce integration time if not at minimum (parallel reduction)
+    if (current_integration_time != TSL2591_INTEGRATIONTIME_100MS) {
       switch(current_integration_time) {
         case TSL2591_INTEGRATIONTIME_600MS: new_integration_time = TSL2591_INTEGRATIONTIME_500MS; break;
         case TSL2591_INTEGRATIONTIME_500MS: new_integration_time = TSL2591_INTEGRATIONTIME_400MS; break;
@@ -146,6 +206,7 @@ bool adjustGainAndIntegrationTime(uint16_t full_value) {
         default: break;
       }
       changed = true;
+    }
     }
   }
   // If signal is very low, try to increase integration time first, then gain
