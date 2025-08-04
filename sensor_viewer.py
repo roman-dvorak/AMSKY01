@@ -29,10 +29,12 @@ class SensorData:
     """Container for sensor data with thread-safe access"""
     def __init__(self):
         self.lock = threading.Lock()
+        self.data_count = 0
+        self.start_time = time.time()
         
         # Latest values for display
         self.latest = {
-            'hygro': {'temp': None, 'humid': None},
+            'hygro': {'temp': None, 'humid': None, 'dew_point': None},
             'light': {'lux': None, 'raw': None, 'ir': None, 'gain': None, 'integration': None},
             'thermal': {'tl': None, 'tr': None, 'bl': None, 'br': None, 'center': None}
         }
@@ -40,13 +42,15 @@ class SensorData:
     def add_data(self, sensor_type, data):
         """Add new sensor data point"""
         with self.lock:
+            self.data_count += 1
             print(f"[DEBUG SensorData] Adding {sensor_type} data: {data}")
             
             if sensor_type == 'hygro' and len(data) >= 2:
                 try:
                     temp = float(data[0])
                     humid = float(data[1])
-                    self.latest['hygro'] = {'temp': temp, 'humid': humid}
+                    dew_point = self.calculate_dew_point(temp, humid)
+                    self.latest['hygro'] = {'temp': temp, 'humid': humid, 'dew_point': dew_point}
                 except ValueError:
                     pass
                     
@@ -128,6 +132,32 @@ class SensorData:
             return f"{lux * 1e6:.3f} μlux"
         else:
             return f"{lux * 1e9:.3f} nlux"
+    
+    def calculate_dew_point(self, temp_c, humidity_percent):
+        """Calculate dew point using Magnus formula"""
+        try:
+            if temp_c is None or humidity_percent is None:
+                return None
+            
+            a = 17.27
+            b = 237.7
+            
+            alpha = ((a * temp_c) / (b + temp_c)) + math.log(humidity_percent / 100.0)
+            dew_point = (b * alpha) / (a - alpha)
+            
+            return dew_point
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return None
+    
+    def get_stats(self):
+        """Get session statistics"""
+        with self.lock:
+            uptime = time.time() - self.start_time
+            return {
+                'data_count': self.data_count,
+                'uptime': uptime,
+                'start_time': self.start_time
+            }
 
 
 class DataLogger:
@@ -258,7 +288,7 @@ class DataLogger:
             return None
             
     def _logger_loop(self):
-        """Main logger loop - checks for data to save every 5 seconds"""
+        """Main logger loop - checks for data to save every 2 seconds"""
         while self.running:
             current_time = time.time()
             
@@ -269,12 +299,16 @@ class DataLogger:
                 self._create_new_file()
                 self._calculate_next_rotation_time()
                 
-            # Save data every 30 seconds or if buffer gets large
-            elif (current_time - self.last_save_time >= 30 or 
-                  len(self.data_buffer) >= 100):
+            # Save data more frequently: every 10 seconds or if buffer gets large
+            elif (current_time - self.last_save_time >= 10 or 
+                  len(self.data_buffer) >= 50):
                 self._save_buffered_data()
                 
-            time.sleep(5)  # Check every 5 seconds
+            # Force flush to disk every 2 minutes even if no new data
+            elif (current_time - self.last_save_time >= 120):
+                self._force_flush_file()
+                
+            time.sleep(2)  # Check every 2 seconds
             
     def _calculate_next_rotation_time(self):
         """Calculate next rotation time aligned to next 10-minute UTC boundary"""
@@ -296,10 +330,19 @@ class DataLogger:
         print(f"[DataLogger] Next file rotation at: {next_boundary.strftime('%Y-%m-%d %H:%M:%S')} UTC")
             
     def _create_new_file(self):
-        """Create a new CSV file with timestamp"""
+        """Create a new CSV file with timestamp in year/month/day directory structure"""
         timestamp = datetime.now(timezone.utc)
+        
+        # Create year/month/day directory structure
+        year_dir = os.path.join(self.log_dir, timestamp.strftime('%Y'))
+        month_dir = os.path.join(year_dir, timestamp.strftime('%m'))
+        day_dir = os.path.join(month_dir, timestamp.strftime('%d'))
+        
+        # Create directories if they don't exist
+        os.makedirs(day_dir, exist_ok=True)
+        
         filename = f"amsky01_data_{timestamp.strftime('%Y%m%d_%H%M%S')}_UTC.csv"
-        filepath = os.path.join(self.log_dir, filename)
+        filepath = os.path.join(day_dir, filename)
         
         try:
             self.current_file_handle = open(filepath, 'w', newline='', encoding='utf-8')
@@ -563,9 +606,10 @@ class SerialReader:
 
 class CLIInterface:
     """ncurses-based CLI interface"""
-    def __init__(self, sensor_data, serial_reader):
+    def __init__(self, sensor_data, serial_reader, data_logger=None):
         self.sensor_data = sensor_data
         self.serial_reader = serial_reader
+        self.data_logger = data_logger
         self.stdscr = None
         
     def run(self):
@@ -604,64 +648,138 @@ class CLIInterface:
         height, width = self.stdscr.getmaxyx()
         
         # Title
-        title = "AMSKY01 Sensor Data Viewer (CLI Mode)"
+        title = "AMSKY01 Sensor Data Viewer"
         self.stdscr.addstr(0, (width - len(title)) // 2, title, curses.color_pair(4) | curses.A_BOLD)
         
         # Instructions
-        self.stdscr.addstr(1, 0, "Press 'q' to quit", curses.color_pair(2))
+        self.stdscr.addstr(1, 2, "Press 'q' to quit", curses.color_pair(2))
         
         # Get latest data
         data = self.sensor_data.get_latest_data()
         
-        # Hygro section
-        self.stdscr.addstr(3, 0, "┌─ HYGRO SENSOR ─────────────────────┐", curses.color_pair(1))
+        # Draw boxes properly with consistent width
+        box_width = 40
+        
+        # Hygro section (expand to include dew point)
+        self._draw_box(3, 2, box_width, "HYGRO SENSOR", curses.color_pair(1))
         if data['hygro']['temp'] is not None:
-            self.stdscr.addstr(4, 0, f"│ Temperature: {data['hygro']['temp']:7.2f} °C       │")
-            self.stdscr.addstr(5, 0, f"│ Humidity:    {data['hygro']['humid']:7.2f} %        │")
+            self.stdscr.addstr(4, 4, f"Temperature: {data['hygro']['temp']:7.2f} °C")
+            self.stdscr.addstr(5, 4, f"Humidity:    {data['hygro']['humid']:7.2f} %")
+            if data['hygro']['dew_point'] is not None:
+                self.stdscr.addstr(6, 4, f"Dew Point:   {data['hygro']['dew_point']:7.2f} °C")
+            else:
+                self.stdscr.addstr(6, 4, "Dew Point:   ---.-- °C")
         else:
-            self.stdscr.addstr(4, 0, "│ Temperature: ---.-- °C       │")
-            self.stdscr.addstr(5, 0, "│ Humidity:    ---.-- %        │")
-        self.stdscr.addstr(6, 0, "└────────────────────────────────────┘")
+            self.stdscr.addstr(4, 4, "Temperature: ---.-- °C")
+            self.stdscr.addstr(5, 4, "Humidity:    ---.-- %")
+            self.stdscr.addstr(6, 4, "Dew Point:   ---.-- °C")
         
-        # Light section
-        self.stdscr.addstr(8, 0, "┌─ LIGHT SENSOR ─────────────────────┐", curses.color_pair(1))
+        # Light section (move down to avoid overlap)
+        self._draw_box(8, 2, box_width, "LIGHT SENSOR", curses.color_pair(1))
         if data['light']['lux'] is not None:
-            self.stdscr.addstr(9, 0,  f"│ Lux:         {str(data['light']['lux']):>15s} │")
-            self.stdscr.addstr(10, 0, f"│ Raw:         {data['light']['raw']:10d}      │")
-            self.stdscr.addstr(11, 0, f"│ IR:          {data['light']['ir']:10d}      │")
-            self.stdscr.addstr(12, 0, f"│ Gain:        {str(data['light']['gain']):>10s}      │")
-            self.stdscr.addstr(13, 0, f"│ Integration: {str(data['light']['integration']):>10s} ms  │")
+            self.stdscr.addstr(9, 4,  f"Lux:         {str(data['light']['lux'])}")
+            self.stdscr.addstr(10, 4,  f"Raw:         {data['light']['raw']:d}")
+            self.stdscr.addstr(11, 4, f"IR:          {data['light']['ir']:d}")
+            self.stdscr.addstr(12, 4, f"Gain:        {str(data['light']['gain'])}")
+            self.stdscr.addstr(13, 4, f"Integration: {str(data['light']['integration'])} ms")
         else:
-            self.stdscr.addstr(9, 0,  "│ Lux:         ----------      │")
-            self.stdscr.addstr(10, 0, "│ Raw:         ----------      │")
-            self.stdscr.addstr(11, 0, "│ IR:          ----------      │")
-            self.stdscr.addstr(12, 0, "│ Gain:        ----------      │")
-            self.stdscr.addstr(13, 0, "│ Integration: ---------- ms  │")
-        self.stdscr.addstr(14, 0, "└────────────────────────────────────┘")
+            self.stdscr.addstr(9, 4,  "Lux:         ----------")
+            self.stdscr.addstr(10, 4,  "Raw:         ----------")
+            self.stdscr.addstr(11, 4, "IR:          ----------")
+            self.stdscr.addstr(12, 4, "Gain:        ----------")
+            self.stdscr.addstr(13, 4, "Integration: ---------- ms")
         
-        # Thermal section
-        self.stdscr.addstr(16, 0, "┌─ THERMAL SENSOR ───────────────────┐", curses.color_pair(1))
+        # Thermal section (move down to avoid overlap)
+        self._draw_box(15, 2, box_width, "THERMAL SENSOR", curses.color_pair(1))
         if data['thermal']['tl'] is not None:
-            self.stdscr.addstr(17, 0, f"│ Top-Left:    {data['thermal']['tl']:8.2f}         │")
-            self.stdscr.addstr(18, 0, f"│ Top-Right:   {data['thermal']['tr']:8.2f}         │")
-            self.stdscr.addstr(19, 0, f"│ Bottom-Left: {data['thermal']['bl']:8.2f}         │")
-            self.stdscr.addstr(20, 0, f"│ Bottom-Right:{data['thermal']['br']:8.2f}         │")
-            self.stdscr.addstr(21, 0, f"│ Center:      {data['thermal']['center']:8.2f}         │")
+            self.stdscr.addstr(16, 4, f"Top-Left:     {data['thermal']['tl']:8.2f}")
+            self.stdscr.addstr(17, 4, f"Top-Right:    {data['thermal']['tr']:8.2f}")
+            self.stdscr.addstr(18, 4, f"Bottom-Left:  {data['thermal']['bl']:8.2f}")
+            self.stdscr.addstr(19, 4, f"Bottom-Right: {data['thermal']['br']:8.2f}")
+            self.stdscr.addstr(20, 4, f"Center:       {data['thermal']['center']:8.2f}")
         else:
-            self.stdscr.addstr(17, 0, "│ Top-Left:    --------         │")
-            self.stdscr.addstr(18, 0, "│ Top-Right:   --------         │")
-            self.stdscr.addstr(19, 0, "│ Bottom-Left: --------         │")
-            self.stdscr.addstr(20, 0, "│ Bottom-Right:--------         │")
-            self.stdscr.addstr(21, 0, "│ Center:      --------         │")
-        self.stdscr.addstr(22, 0, "└────────────────────────────────────┘")
+            self.stdscr.addstr(16, 4, "Top-Left:     --------")
+            self.stdscr.addstr(17, 4, "Top-Right:    --------")
+            self.stdscr.addstr(18, 4, "Bottom-Left:  --------")
+            self.stdscr.addstr(19, 4, "Bottom-Right: --------")
+            self.stdscr.addstr(20, 4, "Center:       --------")
+        
+        # Status section (new box)
+        self._draw_box(22, 2, box_width, "STATUS", curses.color_pair(4))
         
         # Connection status
         status_color = curses.color_pair(1) if self.serial_reader.running else curses.color_pair(3)
         status_text = "Connected" if self.serial_reader.running else "Disconnected"
-        self.stdscr.addstr(24, 0, f"Status: {status_text}", status_color)
-        self.stdscr.addstr(25, 0, f"Port: {self.serial_reader.port}")
+        self.stdscr.addstr(23, 4, f"Connection: {status_text}", status_color)
+        self.stdscr.addstr(24, 4, f"Port: {self.serial_reader.port}")
+        
+        # Session statistics
+        stats = self.sensor_data.get_stats()
+        uptime_str = self._format_uptime(stats.get('uptime', 0))
+        self.stdscr.addstr(25, 4, f"Data points: {stats.get('data_count', 0)}")
+        self.stdscr.addstr(26, 4, f"Session time: {uptime_str}")
+        
+        # Logging status
+        if self.data_logger and self.data_logger.running:
+            current_file = "" if not self.data_logger.current_file else os.path.basename(self.data_logger.current_file)
+            self.stdscr.addstr(27, 4, f"Logging: ON", curses.color_pair(1))
+            if current_file:
+                # Truncate long filenames
+                if len(current_file) > 30:
+                    current_file = current_file[:27] + "..."
+                self.stdscr.addstr(28, 4, f"File: {current_file}")
+        else:
+            self.stdscr.addstr(27, 4, f"Logging: OFF", curses.color_pair(3))
+        
+        # Current time
+        current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.stdscr.addstr(0, width - len(current_time) - 2, current_time, curses.color_pair(2))
         
         self.stdscr.refresh()
+    
+    def _format_uptime(self, uptime_seconds):
+        """Format uptime in human readable format"""
+        if uptime_seconds < 60:
+            return f"{int(uptime_seconds)}s"
+        elif uptime_seconds < 3600:
+            minutes = int(uptime_seconds // 60)
+            seconds = int(uptime_seconds % 60)
+            return f"{minutes}m {seconds}s"
+        else:
+            hours = int(uptime_seconds // 3600)
+            minutes = int((uptime_seconds % 3600) // 60)
+            return f"{hours}h {minutes}m"
+    
+    def _draw_box(self, y, x, width, title, color):
+        """Draw a box with title"""
+        # Top border with title
+        title_text = f" {title} "
+        border_length = width - len(title_text) - 2
+        left_border = "─" * (border_length // 2)
+        right_border = "─" * (border_length - border_length // 2)
+        
+        top_line = f"┌{left_border}{title_text}{right_border}┐"
+        self.stdscr.addstr(y, x, top_line, color)
+        
+        # Side borders (height depends on content)
+        if "HYGRO" in title:
+            box_height = 4  # Added dew point
+        elif "LIGHT" in title:
+            box_height = 6
+        elif "THERMAL" in title:
+            box_height = 6
+        elif "STATUS" in title:
+            box_height = 7  # Status info
+        else:
+            box_height = 3
+            
+        for i in range(1, box_height):
+            self.stdscr.addstr(y + i, x, "│", color)
+            self.stdscr.addstr(y + i, x + width - 1, "│", color)
+        
+        # Bottom border
+        bottom_line = "└" + "─" * (width - 2) + "┘"
+        self.stdscr.addstr(y + box_height, x, bottom_line, color)
 
 
 
@@ -739,7 +857,7 @@ def main():
     print("Starting CLI interface...")
     
     try:
-        app = CLIInterface(sensor_data, serial_reader)
+        app = CLIInterface(sensor_data, serial_reader, data_logger)
         app.run()
     except KeyboardInterrupt:
         print("\nShutting down...")
