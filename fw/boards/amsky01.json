@@ -1,0 +1,48 @@
+{
+  "build": {
+    "arduino": {
+      "earlephilhower": {
+        "variant": "rpipico",
+        "boot2_source": "boot2_w25q080_2_padded_checksum.S",
+        "usb_vid": "0x1209",
+        "usb_pid": "0xAE02",
+        "usb_manufacturer": "AstroMeters.eu",
+        "usb_product": "AMSKY01"
+      }
+    },
+    "core": "arduino",
+    "cpu": "cortex-m0plus",
+    "extra_flags": "-D ARDUINO_RASPBERRY_PI_PICO -DARDUINO_ARCH_RP2040 -DUSBD_MAX_POWER_MA=500",
+    "f_cpu": "133000000L",
+    "hwids": [
+      [
+        "0xAE02",
+        "0x1209"
+      ]
+    ],
+    "mcu": "rp2040",
+    "variant": "RASPBERRY_PI_PICO"
+  },
+  "debug": {
+    "jlink_device": "RP2040_M0_0",
+    "openocd_target": "rp2040.cfg",
+    "svd_path": "rp2040.svd"
+  },
+  "frameworks": ["arduino"],
+  "name": "AMSKY01",
+  "upload": {
+    "maximum_ram_size": 262144,
+    "maximum_size": 2097152,
+    "require_upload_port": true,
+    "native_usb": true,
+    "use_1200bps_touch": true,
+    "wait_for_upload_port": false,
+    "protocol": "picotool",
+    "protocols": [
+      "blackmagic","cmsis-dap","jlink","raspberrypi-swd","picotool","picoprobe"
+    ]
+  },
+  "url": "https://astrometers.eu/",
+  "vendor": "AstroMeters.eu"
+}
+
